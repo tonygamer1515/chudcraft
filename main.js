@@ -4,7 +4,7 @@
    and UI. Fan-made, no assets/code from any commercial game, not affiliated
    with Mojang/Minecraft. */
 import * as THREE from "./vendor/three.module.js";
-import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js?v=6";
+import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js?v=7";
 
 /* ============================ constants ============================ */
 const CH = 16;          // chunk size (x/z)
@@ -708,20 +708,28 @@ ui.menu.querySelector("button").addEventListener("pointerdown", (e) => {
   ui.menu.classList.add("hidden");
   spawn();
   updateChunks();
+  player.pitch = -0.32;                 // start looking down at the land, not at the sky
+  player.yaw = 0.6;
+  camera.rotation.set(player.pitch, player.yaw, 0);
+  lockGrace = performance.now() + 400;  // ignore any lock-jump deltas
   requestLock();
   if (!isLocked() && !dragMode) setTimeout(() => { if (!isLocked()) fallbackMode(); }, 300);
   ui.pause.classList.add("hidden");
-  camera.rotation.set(player.pitch, player.yaw, 0);
   toast("left: mine · right: place · F: fly · 1-8: blocks · glow rock lights caves!");
 });
 ui.pause.addEventListener("pointerdown", (e) => { e.preventDefault(); requestLock(); });
 gl.addEventListener("click", () => { if (started && !IS_TOUCH) requestLock(); });
 
-document.addEventListener("pointerlockchange", syncPause);
 document.addEventListener("pointerlockerror", fallbackMode);
 
+let lockGrace = 0;                      // ignore bogus first deltas after pointer lock
+document.addEventListener("pointerlockchange", () => {
+  lockGrace = performance.now() + 250;   // 250ms grace: lock can fire a fake giant mousemove
+  syncPause();
+});
 document.addEventListener("mousemove", (e) => {
   if (!started) return;
+  if (performance.now() < lockGrace) return;
   if (isLocked()) {
     player.yaw -= e.movementX * 0.0023;
     player.pitch -= e.movementY * 0.0023;
