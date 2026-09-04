@@ -4,7 +4,7 @@
    and UI. Fan-made, no assets/code from any commercial game, not affiliated
    with Mojang/Minecraft. */
 import * as THREE from "./vendor/three.module.js";
-import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js?v=5";
+import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js?v=6";
 
 /* ============================ constants ============================ */
 const CH = 16;          // chunk size (x/z)
@@ -136,17 +136,17 @@ function fbm2(x, z, oct) {
   return v / tot;
 }
 
-/* nicer terrain: continents + ridged mountains + detail.
-   Base sits ABOVE water level so oceans are rare; lakes only form in
-   genuine basins. Mountains grow on high continents near ridge lines. */
+/* classic-style terrain: rolling green countryside around sea level,
+   real oceans where the land dips low, sandy beaches at the water's edge,
+   occasional large mountains on big landmasses — the iconic alpha look. */
 function terrainH(gx, gz) {
-  const c = fbm2(gx * 0.011, gz * 0.011, 3);                                   // continental 0..1
-  const rw = 1 - Math.abs(2 * noise2(gx * 0.021 + 50, gz * 0.021 - 10) - 1);   // ridge 0..1
-  const hills = (noise2(gx * 0.055 + 7, gz * 0.055 + 3) - 0.5);
-  const det = (noise2(gx * 0.17, gz * 0.17 + 20) - 0.5);
-  let h = 38 + (c - 0.5) * 14 + hills * 7 +
-           Math.pow(rw, 2.2) * Math.max(0, c - 0.4) * 46 + det * 2;
-  return Math.max(26, Math.min(62, Math.round(h)));
+  const c = fbm2(gx * 0.0105, gz * 0.0105, 3);                                 // continents 0..1
+  const rw = 1 - Math.abs(2 * noise2(gx * 0.018 + 50, gz * 0.018 - 10) - 1);   // ridge 0..1
+  const hills = (noise2(gx * 0.05 + 7, gz * 0.05 + 3) - 0.5);
+  const det = (noise2(gx * 0.15, gz * 0.15 + 20) - 0.5);
+  let h = 33.5 + (c - 0.5) * 15 + hills * 8.5 +                                // rolling land, dips below WL = seas
+           Math.pow(rw, 2.6) * Math.max(0, c - 0.52) * 62 + det * 2;           // rare mountains
+  return Math.max(20, Math.min(62, Math.round(h)));
 }
 
 /* ============================ light engine ============================ */
@@ -255,7 +255,7 @@ function genBase(c) {
     for (let z = 0; z < CH; z++) {
       const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
-      const beach = h <= WL + 1;                       // sand skin only around lakes
+      const beach = h <= WL + 2;                       // sand skin around every shore
       for (let y = 0; y < H; y++) {
         if (y === 0) d[idx(x, y, z)] = BEDROCK;
         else if (y < h - 3) d[idx(x, y, z)] = STONE;
@@ -489,19 +489,28 @@ const HALF = 0.3, EYE = 1.62;
 function spawn() {
   let sx = 8, sz = 8;
   outer:
-  for (let r = 0; r < 60; r++) {
-    for (let a = 0; a < 24; a++) {
-      const gx = sx + Math.round(Math.cos(a / 24 * Math.PI * 2) * r);
-      const gz = sz + Math.round(Math.sin(a / 24 * Math.PI * 2) * r);
+  for (let r = 0; r < 80; r++) {
+    for (let a = 0; a < 32; a++) {
+      const gx = sx + Math.round(Math.cos(a / 32 * Math.PI * 2) * r);
+      const gz = sz + Math.round(Math.sin(a / 32 * Math.PI * 2) * r);
       const h = terrainH(gx, gz);
-      if (h < WL + 5 || h > 48) continue;              // grassy, well above water
-      let flat = true;
-      for (let dx = -6; dx <= 6 && flat; dx += 2) {
-        for (let dz = -6; dz <= 6 && flat; dz += 2) {
+      if (h < WL + 3 || h > 46) continue;              // dry, not a mountain
+      let flat = true;                                 // flat enough meadow
+      for (let dx = -5; dx <= 5 && flat; dx += 2) {
+        for (let dz = -5; dz <= 5 && flat; dz += 2) {
           if (Math.abs(terrainH(gx + dx, gz + dz) - h) > 3) flat = false;
         }
       }
-      if (flat) { sx = gx; sz = gz; break outer; }
+      if (!flat) continue;
+      let nearWater = false;                           // classic coastal spawn
+      for (let d = 8; d <= 30 && !nearWater; d += 4) {
+        for (let dd = 0; dd < 12; dd++) {
+          const wx = gx + Math.round(Math.cos(dd / 12 * Math.PI * 2) * d);
+          const wz = gz + Math.round(Math.sin(dd / 12 * Math.PI * 2) * d);
+          if (terrainH(wx, wz) <= WL) { nearWater = true; break; }
+        }
+      }
+      if (nearWater) { sx = gx; sz = gz; break outer; }
     }
   }
   player.pos.set(sx + 0.5, terrainH(sx, sz) + 3, sz + 0.5);
