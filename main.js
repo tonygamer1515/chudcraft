@@ -4,7 +4,7 @@
    and UI. Fan-made, no assets/code from any commercial game, not affiliated
    with Mojang/Minecraft. */
 import * as THREE from "./vendor/three.module.js";
-import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js";
+import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js?v=5";
 
 /* ============================ constants ============================ */
 const CH = 16;          // chunk size (x/z)
@@ -136,14 +136,17 @@ function fbm2(x, z, oct) {
   return v / tot;
 }
 
-/* nicer terrain: continents + ridged mountains + detail */
+/* nicer terrain: continents + ridged mountains + detail.
+   Base sits ABOVE water level so oceans are rare; lakes only form in
+   genuine basins. Mountains grow on high continents near ridge lines. */
 function terrainH(gx, gz) {
   const c = fbm2(gx * 0.011, gz * 0.011, 3);                                   // continental 0..1
   const rw = 1 - Math.abs(2 * noise2(gx * 0.021 + 50, gz * 0.021 - 10) - 1);   // ridge 0..1
   const hills = (noise2(gx * 0.055 + 7, gz * 0.055 + 3) - 0.5);
   const det = (noise2(gx * 0.17, gz * 0.17 + 20) - 0.5);
-  let h = 34 + (c - 0.5) * 9 + hills * 7 + Math.pow(rw, 2.1) * Math.max(0, c - 0.42) * 34 + det * 2.4;
-  return Math.max(24, Math.min(58, Math.round(h)));
+  let h = 38 + (c - 0.5) * 14 + hills * 7 +
+           Math.pow(rw, 2.2) * Math.max(0, c - 0.4) * 46 + det * 2;
+  return Math.max(26, Math.min(62, Math.round(h)));
 }
 
 /* ============================ light engine ============================ */
@@ -252,14 +255,13 @@ function genBase(c) {
     for (let z = 0; z < CH; z++) {
       const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
-      const beach = h <= WL + 1;
-      const top = beach ? SAND : GRASS;
+      const beach = h <= WL + 1;                       // sand skin only around lakes
       for (let y = 0; y < H; y++) {
         if (y === 0) d[idx(x, y, z)] = BEDROCK;
         else if (y < h - 3) d[idx(x, y, z)] = STONE;
         else if (y < h) d[idx(x, y, z)] = beach ? SAND : DIRT;
-        else if (y === h) d[idx(x, y, z)] = top;
-        else if (y <= WL) d[idx(x, y, z)] = WATER;
+        else if (y === h) d[idx(x, y, z)] = beach ? SAND : GRASS;
+        else if (y <= WL) d[idx(x, y, z)] = WATER;     // lakes in basins only
         else break;
       }
     }
@@ -274,12 +276,12 @@ function carveCaves(c) {
     for (let z = 0; z < CH; z++) {
       const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
-      const hLim = Math.min(h - 4, WL + 6);            // never break the surface
-      for (let y = 4; y < hLim; y++) {
+      const hLim = Math.min(h - 7, WL + 4);            // never break the surface
+      for (let y = 5; y < hLim; y++) {
         const n1 = noise3(gx * 0.085, y * 0.11, gz * 0.085);
-        if (n1 > 0.60) continue;
+        if (n1 > 0.62) continue;
         const n2 = noise3(gx * 0.19 + 9, y * 0.23, gz * 0.19 - 4);
-        if (n1 < 0.34 && n2 < 0.5) {
+        if (n1 < 0.30 && n2 < 0.45) {
           d[idx(x, y, z)] = AIR;
           const below = d[idx(x, y - 1, z)];
           if (SOLID.has(below)) {
@@ -487,11 +489,19 @@ const HALF = 0.3, EYE = 1.62;
 function spawn() {
   let sx = 8, sz = 8;
   outer:
-  for (let r = 0; r < 30; r++) {
-    for (let a = 0; a < 12; a++) {
-      const gx = sx + Math.round(Math.cos(a / 12 * Math.PI * 2) * r);
-      const gz = sz + Math.round(Math.sin(a / 12 * Math.PI * 2) * r);
-      if (terrainH(gx, gz) >= WL + 2) { sx = gx; sz = gz; break outer; }
+  for (let r = 0; r < 60; r++) {
+    for (let a = 0; a < 24; a++) {
+      const gx = sx + Math.round(Math.cos(a / 24 * Math.PI * 2) * r);
+      const gz = sz + Math.round(Math.sin(a / 24 * Math.PI * 2) * r);
+      const h = terrainH(gx, gz);
+      if (h < WL + 5 || h > 48) continue;              // grassy, well above water
+      let flat = true;
+      for (let dx = -6; dx <= 6 && flat; dx += 2) {
+        for (let dz = -6; dz <= 6 && flat; dz += 2) {
+          if (Math.abs(terrainH(gx + dx, gz + dz) - h) > 3) flat = false;
+        }
+      }
+      if (flat) { sx = gx; sz = gz; break outer; }
     }
   }
   player.pos.set(sx + 0.5, terrainH(sx, sz) + 3, sz + 0.5);
