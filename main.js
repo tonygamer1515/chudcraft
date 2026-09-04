@@ -156,50 +156,63 @@ function lightGet(gx, gy, gz) {
   return c.light[idx(lx, gy, lz)];
 }
 
-function recomputeLight(c) {
-  const L = c.light, d = c.data;
-  L.fill(0);
+/* recompute light for a SET of chunks in ONE global pass, so cross-border
+   light is never wiped by a later per-chunk recompute */
+function recomputeLights(list) {
   const queue = [];
-  // 1) skylight columns: walk down until an opaque block
-  for (let x = 0; x < CH; x++) {
-    for (let z = 0; z < CH; z++) {
-      let v = 15;
-      for (let y = H - 1; y >= 0; y--) {
-        const b = d[idx(x, y, z)];
-        if (b === AIR || b === WATER || b === LAVA) { /* transparent */ }
-        else if (b === LEAVES) { if (v === 15) v = 11; }
-        else break;
-        L[idx(x, y, z)] = v;
-        queue.push(idx(x, y, z));
+  const push = (ch, i) => queue.push({ ch, i });
+  for (const c of list) {
+    const L = c.light, d = c.data;
+    L.fill(0);
+    // 1) skylight columns: walk down until an opaque block
+    for (let x = 0; x < CH; x++) {
+      for (let z = 0; z < CH; z++) {
+        let v = 15;
+        for (let y = H - 1; y >= 0; y--) {
+          const b = d[idx(x, y, z)];
+          if (b === AIR || b === WATER || b === LAVA) { /* transparent */ }
+          else if (b === LEAVES) { if (v === 15) v = 11; }
+          else break;
+          L[idx(x, y, z)] = v;
+          push(c, idx(x, y, z));
+        }
       }
     }
+    // 2) block light sources
+    for (let y = 0; y < H; y++) for (let z = 0; z < CH; z++) for (let x = 0; x < CH; x++) {
+      const b = d[idx(x, y, z)];
+      if (b === LAVA || b === GLOW) { const i = idx(x, y, z); if (L[i] < 15) { L[i] = 15; push(c, i); } }
+    }
   }
-  // 2) block light sources
-  for (let y = 0; y < H; y++) for (let z = 0; z < CH; z++) for (let x = 0; x < CH; x++) {
-    const b = d[idx(x, y, z)];
-    if (b === LAVA || b === GLOW) { const i = idx(x, y, z); if (L[i] < 15) { L[i] = 15; queue.push(i); } }
-  }
-  // 3) flood propagation (breadth first, -1 per step)
+  // 3) one global flood (breadth first, -1 per step) that crosses chunk borders
   let head = 0;
   while (head < queue.length) {
-    const i = queue[head++];
-    const lv = L[i];
+    const { ch, i } = queue[head++];
+    const LV = ch.light;
+    const lv = LV[i];
     if (lv <= 1) continue;
     const x = i % CH;
     const z = ((i / CH) | 0) % CH;
     const y = ((i / (CH * CH)) | 0);
     const nxt = lv - 1;
+    const wx = ch.cx * CH + x, wz = ch.cz * CH + z;
     for (const [dx, dy, dz] of FACE_DIRS) {
-      const nx = x + dx, ny = y + dy, nz = z + dz;
+      const ny = y + dy;
       if (ny < 0 || ny >= H) continue;
-      if (nx >= 0 && nx < CH && nz >= 0 && nz < CH && ny >= 0 && ny < H) {
-        const ti = idx(nx, ny, nz);
-        if (!TRANSPARENT_LIGHT(d[ti])) continue;
-        if (L[ti] >= nxt) continue;
-        L[ti] = nxt;
-        queue.push(ti);
+      const nxx = x + dx, nzz = z + dz;
+      let nc = ch, ncx = nxx, ncz = nzz;
+      if (nxx < 0 || nxx >= CH || nzz < 0 || nzz >= CH) {
+        const gw = wx + dx, gz2 = wz + dz;
+        nc = chunks.get(key(chunkOf(gw), chunkOf(gz2)));
+        if (!nc) continue;
+        ncx = gw - nc.cx * CH;
+        ncz = gz2 - nc.cz * CH;
       }
-      // outside the chunk: neighbouring chunk recomputes itself (rare seams acceptable)
+      const ti = idx(ncx, ny, ncz);
+      if (!TRANSPARENT_LIGHT(nc.data[ti])) continue;
+      if (nc.light[ti] >= nxt) continue;
+      nc.light[ti] = nxt;
+      push(nc, ti);
     }
   }
 }
@@ -219,65 +232,88 @@ function worldSet(gx, gy, gz, id) {
   c.data[idx(gx - c.cx * CH, gy, gz - c.cz * CH)] = id;
 }
 
-function genChunk(c) {
+/* writes across chunk borders; returns the chunk key it touched (or null) */
+function setInto(gx, gy, gz, id) {
+  if (gy < 1 || gy >= H) return null;
+  const cx = chunkOf(gx), cz = chunkOf(gz);
+  const c = chunks.get(key(cx, cz));
+  if (!c) return null;
+  c.data[idx(gx - cx * CH, gy, gz - cz * CH)] = id;
+  return key(cx, cz);
+}
+
+/* phase 1: solid terrain + lakes + caves. Caves are carved on the FULL
+   x/z range using world-space noise, so tunnels continue seamlessly into
+   neighbouring chunks (no more 16-block wall patterns at borders). */
+function genBase(c) {
   const d = c.data;
   const cx0 = c.cx * CH, cz0 = c.cz * CH;
-  // columns: base layers + surface + lakes
   for (let x = 0; x < CH; x++) {
     for (let z = 0; z < CH; z++) {
       const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
-      const beach = h <= WL + 1;                       // sand near & under water
+      const beach = h <= WL + 1;
       const top = beach ? SAND : GRASS;
       for (let y = 0; y < H; y++) {
         if (y === 0) d[idx(x, y, z)] = BEDROCK;
         else if (y < h - 3) d[idx(x, y, z)] = STONE;
         else if (y < h) d[idx(x, y, z)] = beach ? SAND : DIRT;
         else if (y === h) d[idx(x, y, z)] = top;
-        else if (y <= WL) d[idx(x, y, z)] = WATER;     // lakes
+        else if (y <= WL) d[idx(x, y, z)] = WATER;
         else break;
       }
     }
   }
-  // caves + lava + glowstone (3D noise carve)
-  for (let x = 1; x < CH - 1; x++) {
-    for (let z = 1; z < CH - 1; z++) {
+  carveCaves(c);
+}
+
+function carveCaves(c) {
+  const d = c.data;
+  const cx0 = c.cx * CH, cz0 = c.cz * CH;
+  for (let x = 0; x < CH; x++) {
+    for (let z = 0; z < CH; z++) {
       const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
-      for (let y = 4; y < h - 4; y++) {
-        if (y > WL + 8) break;
-        const i = idx(x, y, z);
-        const n = noise3(gx * 0.085, y * 0.11, gz * 0.085);
-        if (n > 0.60) continue;
-        // widen: second frequency keeps tunnels from being too thin
+      const hLim = Math.min(h - 4, WL + 6);            // never break the surface
+      for (let y = 4; y < hLim; y++) {
+        const n1 = noise3(gx * 0.085, y * 0.11, gz * 0.085);
+        if (n1 > 0.60) continue;
         const n2 = noise3(gx * 0.19 + 9, y * 0.23, gz * 0.19 - 4);
-        if (n < 0.34 && n2 < 0.5) {
-          d[i] = AIR;
-          // lava pools in deep cave floors
+        if (n1 < 0.34 && n2 < 0.5) {
+          d[idx(x, y, z)] = AIR;
           const below = d[idx(x, y - 1, z)];
-          if (y < 20 && SOLID.has(below) && Math.random() < 0.004) d[i] = LAVA;
-          else if (y < 16 && SOLID.has(below) && Math.random() < 0.0012) d[i] = GLOW;
+          if (SOLID.has(below)) {
+            if (y < 20 && Math.random() < 0.004) d[idx(x, y, z)] = LAVA;
+            else if (y < 15 && Math.random() < 0.0012) d[idx(x, y, z)] = GLOW;
+          }
         }
       }
     }
   }
-  // trees (clustered)
-  for (let x = 2; x < CH - 2; x++) {
-    for (let z = 2; z < CH - 2; z++) {
+}
+
+/* phase 2: trees. Runs AFTER every chunk in the radius has base data, so
+   trunks & canopies can cross chunk borders and land in real cells.
+   Returns the set of chunk keys whose data changed. */
+function genTrees(c) {
+  const cx0 = c.cx * CH, cz0 = c.cz * CH;
+  const dirty = new Set();
+  const touch = (k) => { if (k) dirty.add(k); };
+  for (let x = 0; x < CH; x++) {
+    for (let z = 0; z < CH; z++) {
       const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
       if (worldGet(gx, h, gz) !== GRASS) continue;
       const r = hash2(gx * 3.1, gz * 1.7 + 9);
       if (r > 0.0042) continue;
-      // cluster: one tall + small companions
-      const n = 1 + ((hash2(gx, gz * 2.3) * 3) | 0);
+      const n = 1 + ((hash2(gx, gz * 2.3) * 3) | 0);   // clustered companions
       for (let k = 0; k < n; k++) {
-        const tx = gx + ((hash2(gx + k * 7, gz + k * 13) * 5) | 0) - 2;
-        const tz = gz + ((hash2(gx + k * 11, gz + k * 3) * 5) | 0) - 2;
+        const tx = gx + ((hash2(gx + k * 7, gz + k * 13) * 7) | 0) - 3;
+        const tz = gz + ((hash2(gx + k * 11, gz + k * 3) * 7) | 0) - 3;
         const th = terrainH(tx, tz);
         if (worldGet(tx, th, tz) !== GRASS) continue;
         const th2 = 4 + ((hash2(tx, tz * 2.3) * 3) | 0);
-        for (let t = 1; t <= th2; t++) worldSet(tx, th + t, tz, LOG);
+        for (let t = 1; t <= th2; t++) touch(setInto(tx, th + t, tz, LOG));
         const topY = th + th2;
         for (let dy = -2; dy <= 0; dy++) {
           const rad = dy === -2 ? 1 : 2;
@@ -285,14 +321,14 @@ function genChunk(c) {
             if (dy === 0 && dx === 0 && dz === 0) continue;
             if (dx * dx + dz * dz > rad * rad + 1) continue;
             if (dx * dx + dz * dz > rad * rad && (Math.abs(dx) === 2 || Math.abs(dz) === 2)) continue;
-            worldSet(tx + dx, topY + dy, tz + dz, LEAVES);
+            touch(setInto(tx + dx, topY + dy, tz + dz, LEAVES));
           }
         }
-        worldSet(tx, topY + 1, tz, LEAVES);
+        touch(setInto(tx, topY + 1, tz, LEAVES));
       }
     }
   }
-  recomputeLight(c);
+  return dirty;
 }
 
 /* ============================ meshing ============================ */
@@ -400,13 +436,22 @@ function updateChunks() {
       chunks.delete(key(c.cx, c.cz));
     }
   }
+  // phase 0: make sure every chunk in the radius EXISTS (data arrays)
   const need = [];
   for (let dx = -R; dx <= R; dx++) for (let dz = -R; dz <= R; dz++) {
     const cx = pcx + dx, cz = pcz + dz;
-    const k = key(cx, cz);
-    if (!chunks.has(k)) { const c = ensureChunk(cx, cz); genChunk(c); need.push(c); }
+    if (!chunks.has(key(cx, cz))) need.push(ensureChunk(cx, cz));
   }
-  for (const c of need) remesh(c);
+  // phase 1: base terrain + lakes + caves for the new chunks
+  for (const c of need) genBase(c);
+  // phase 2: trees — all neighbours exist now, so nothing gets dropped
+  const dirty = new Set(need.map((c) => key(c.cx, c.cz)));
+  for (const c of need) for (const k of genTrees(c)) dirty.add(k);
+  // phase 3: light (one global pass) + mesh every chunk whose data changed
+  const touched = [];
+  for (const k of dirty) { const c = chunks.get(k); if (c) touched.push(c); }
+  recomputeLights(touched);
+  for (const c of touched) remesh(c);
 }
 
 function setBlock(gx, gy, gz, id) {
@@ -415,13 +460,20 @@ function setBlock(gx, gy, gz, id) {
   const c = chunks.get(key(cx, cz));
   if (!c) return;
   c.data[idx(gx - cx * CH, gy, gz - cz * CH)] = id;
-  recomputeLight(c);
-  remesh(c);
+  // block edits can change light (glow/lava) and culling on both sides of a border
+  const around = new Set([key(cx, cz)]);
   const lx = gx - cx * CH, lz = gz - cz * CH;
-  if (lx === 0) { const n = chunks.get(key(cx - 1, cz)); if (n && n.meshed) remesh(n); }
-  if (lx === CH - 1) { const n = chunks.get(key(cx + 1, cz)); if (n && n.meshed) remesh(n); }
-  if (lz === 0) { const n = chunks.get(key(cx, cz - 1)); if (n && n.meshed) remesh(n); }
-  if (lz === CH - 1) { const n = chunks.get(key(cx, cz + 1)); if (n && n.meshed) remesh(n); }
+  if (lx === 0) around.add(key(cx - 1, cz));
+  if (lx === CH - 1) around.add(key(cx + 1, cz));
+  if (lz === 0) around.add(key(cx, cz - 1));
+  if (lz === CH - 1) around.add(key(cx, cz + 1));
+  const touched = [];
+  for (const k of around) {
+    const n = chunks.get(k);
+    if (n && n.meshed) touched.push(n);
+  }
+  recomputeLights(touched);
+  for (const n of touched) remesh(n);
 }
 
 /* ============================ player ============================ */
