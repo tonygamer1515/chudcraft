@@ -136,6 +136,26 @@ const TILES = {
     }
     for (let i = 0; i < 14; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, C.cbD);
   }, 11),
+  water: makeTile(({ px, rnd }) => {
+    for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+      const wave = Math.sin(x * 1.3 + y * 0.5) * 0.5 + Math.sin(x * 0.4 - y * 0.9) * 0.5;
+      let col = wave > 0.35 ? 0x3f7fdd : wave < -0.35 ? 0x2f66c4 : 0x3773d2;
+      if (rnd() < 0.05) col = 0x4d8de8;
+      px(x, y, col);
+    }
+  }, 12),
+  lava: makeTile(({ px, rnd }) => {
+    for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) px(x, y, 0xd84216);
+    for (let i = 0; i < 30; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, 0xff7a1f);
+    for (let i = 0; i < 16; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, 0xffc23d);
+    for (let i = 0; i < 6; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, 0xffe98a);
+  }, 13),
+  glow: makeTile(({ px, rnd }) => {
+    for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) px(x, y, 0xd8c05a);
+    for (let i = 0; i < 22; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, 0xffed9a);
+    for (let i = 0; i < 10; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, 0xb89a38);
+    for (let i = 0; i < 8; i++) px((rnd() * TILE) | 0, (rnd() * TILE) | 0, 0xfff8d6);
+  }, 14),
 };
 
 const names = Object.keys(TILES);

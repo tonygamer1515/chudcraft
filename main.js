@@ -1,23 +1,29 @@
 /* CHUDCRAFT — original voxel sandbox.
-   Everything here is generated from code: textures, shading (classic
-   per-face brightness table), world, UI. Fan-made, no assets from any
-   commercial game, not affiliated with Mojang/Minecraft. */
+   Everything here is generated from code: textures, world, a from-scratch
+   light engine (skylight columns + flood-fill propagation + glowing blocks),
+   and UI. Fan-made, no assets/code from any commercial game, not affiliated
+   with Mojang/Minecraft. */
 import * as THREE from "./vendor/three.module.js";
 import { buildAtlas, tileCanvas, tileIndex, TILE, ATLAS } from "./textures.js";
 
 /* ============================ constants ============================ */
 const CH = 16;          // chunk size (x/z)
-const H = 56;           // world height
+const H = 60;           // world height
 const R = 3;            // loaded chunk radius
+const WL = 32;          // water level
 
 const AIR = 0, GRASS = 1, DIRT = 2, STONE = 3, SAND = 4,
-      LOG = 5, PLANKS = 6, LEAVES = 7, COBBLE = 8, BEDROCK = 9;
+      LOG = 5, PLANKS = 6, LEAVES = 7, COBBLE = 8, BEDROCK = 9,
+      WATER = 10, LAVA = 11, GLOW = 12;
+
+const SOLID = new Set([GRASS, DIRT, STONE, SAND, LOG, PLANKS, COBBLE, BEDROCK, GLOW, LEAVES]);
+const LIQUID = new Set([WATER, LAVA]);
+const TRANSPARENT_LIGHT = (id) => !SOLID.has(id);   // light passes air/water/lava/leaves
 
 // face order: +y, -y, +x, -x, +z, -z
 const FACE_DIRS = [[0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
-// classic flat shading multipliers (top bright … bottom dark)
+// classic flat-shade multipliers combined with dynamic light
 const FACE_LIGHT = [1.0, 0.5, 0.6, 0.6, 0.8, 0.8];
-// quad corners per face, local offsets, CCW seen from outside
 const QUAD_CORNERS = [
   [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]],   // +y
   [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],   // -y
@@ -39,15 +45,18 @@ const BLOCKS = [
   { n: "leaves", top: T.leaves,    bot: T.leaves,   side: T.leaves },
   { n: "cobble", top: T.cobble,    bot: T.cobble,   side: T.cobble },
   { n: "bedrock", top: T.bedrock,  bot: T.bedrock,  side: T.bedrock },
+  { n: "water",  top: T.water,     bot: T.water,    side: T.water },
+  { n: "lava",   top: T.lava,      bot: T.lava,     side: T.lava },
+  { n: "glow",   top: T.glow,      bot: T.glow,     side: T.glow },
 ];
-const HOTBAR = [GRASS, PLANKS, STONE, SAND, LOG, COBBLE, LEAVES];
+const HOTBAR = [GRASS, PLANKS, STONE, SAND, LOG, COBBLE, LEAVES, GLOW];
 const REACH = 5.5;
 
 /* ============================ renderer ============================ */
 const scene = new THREE.Scene();
 const SKY = 0x9fd9ff;
 scene.background = new THREE.Color(SKY);
-scene.fog = new THREE.Fog(SKY, 40, 130);
+scene.fog = new THREE.Fog(SKY, 45, 140);
 
 const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 400);
 camera.rotation.order = "YXZ";
@@ -67,6 +76,10 @@ atlasTex.colorSpace = THREE.SRGBColorSpace;
 const chunkMat = new THREE.MeshBasicMaterial({
   map: atlasTex, vertexColors: true, side: THREE.DoubleSide,
 });
+const waterMat = new THREE.MeshBasicMaterial({
+  map: atlasTex, vertexColors: true, side: THREE.DoubleSide,
+  transparent: true, opacity: 0.78, depthWrite: false,
+});
 
 addEventListener("resize", () => {
   camera.aspect = innerWidth / innerHeight;
@@ -79,20 +92,27 @@ const chunks = new Map();
 const key = (cx, cz) => cx + "," + cz;
 const idx = (x, y, z) => (y * CH + z) * CH + x;
 const chunkOf = (gx) => Math.floor(gx / CH);
+const SZ = CH * H * CH;
 
 function ensureChunk(cx, cz) {
   const k = key(cx, cz);
   let c = chunks.get(k);
-  if (!c) { c = { cx, cz, data: new Uint8Array(CH * H * CH), mesh: null, meshed: false }; chunks.set(k, c); }
+  if (!c) {
+    c = { cx, cz, data: new Uint8Array(SZ), light: new Uint8Array(SZ),
+          mesh: null, liqMesh: null, meshed: false };
+    chunks.set(k, c);
+  }
   return c;
 }
 
-/* --- terrain --- */
+/* --- noise (all original) --- */
 const SEED = (Math.random() * 1e9) | 0;
-function hash2(x, z) {
-  const s = Math.sin(x * 127.1 + z * 311.7 + SEED * 74.7) * 43758.5453;
-  return s - Math.floor(s);
+function hsh(s) {
+  const x = Math.sin(s) * 43758.5453123;
+  return x - Math.floor(x);
 }
+function hash2(x, z) { return hsh(x * 127.1 + z * 311.7 + SEED * 74.7); }
+function hash3(x, y, z) { return hsh(x * 127.1 + y * 311.7 + z * 74.7 + SEED * 51.3); }
 const smooth = (t) => t * t * (3 - 2 * t);
 function noise2(x, z) {
   const x0 = Math.floor(x), z0 = Math.floor(z);
@@ -100,120 +120,262 @@ function noise2(x, z) {
   const a = hash2(x0, z0), b = hash2(x0 + 1, z0), c = hash2(x0, z0 + 1), d = hash2(x0 + 1, z0 + 1);
   return a + (b - a) * tx + (c - a) * tz + (a - b - c + d) * tx * tz;
 }
-function terrainH(gx, gz) {
-  const n1 = noise2(gx * 0.045, gz * 0.045);
-  const n2 = noise2(gx * 0.13 + 40, gz * 0.13 + 40);
-  let h = 28 + (n1 - 0.5) * 22 + (n2 - 0.5) * 8;
-  return Math.max(14, Math.min(46, Math.round(h)));
+function noise3(x, y, z) {
+  const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
+  const tx = smooth(x - x0), ty = smooth(y - y0), tz = smooth(z - z0);
+  let acc = 0;
+  for (let dx = 0; dx <= 1; dx++) for (let dy = 0; dy <= 1; dy++) for (let dz = 0; dz <= 1; dz++) {
+    const w = (dx ? tx : 1 - tx) * (dy ? ty : 1 - ty) * (dz ? tz : 1 - tz);
+    acc += w * hash3(x0 + dx, y0 + dy, z0 + dz);
+  }
+  return acc;
+}
+function fbm2(x, z, oct) {
+  let v = 0, amp = 0.5, f = 1, tot = 0;
+  for (let i = 0; i < oct; i++) { v += noise2(x * f, z * f) * amp; tot += amp; amp *= 0.5; f *= 2.05; }
+  return v / tot;
 }
 
-function solidAt(gx, gy, gz) {
-  if (gy < 0) return true;
-  if (gy >= H) return false;
-  const c = chunks.get(key(chunkOf(gx), chunkOf(gz)));
-  if (!c) return true;                 // unloaded: treat as solid
-  return c.data[idx(gx - c.cx * CH, gy, gz - c.cz * CH)] !== AIR;
+/* nicer terrain: continents + ridged mountains + detail */
+function terrainH(gx, gz) {
+  const c = fbm2(gx * 0.011, gz * 0.011, 3);                                   // continental 0..1
+  const rw = 1 - Math.abs(2 * noise2(gx * 0.021 + 50, gz * 0.021 - 10) - 1);   // ridge 0..1
+  const hills = (noise2(gx * 0.055 + 7, gz * 0.055 + 3) - 0.5);
+  const det = (noise2(gx * 0.17, gz * 0.17 + 20) - 0.5);
+  let h = 34 + (c - 0.5) * 9 + hills * 7 + Math.pow(rw, 2.1) * Math.max(0, c - 0.42) * 34 + det * 2.4;
+  return Math.max(24, Math.min(58, Math.round(h)));
 }
+
+/* ============================ light engine ============================ */
+function lightGet(gx, gy, gz) {
+  if (gy >= H) return 15;                 // open sky
+  if (gy < 0) return 0;
+  const c = chunks.get(key(chunkOf(gx), chunkOf(gz)));
+  if (!c) return 15;
+  const lx = gx - c.cx * CH, lz = gz - c.cz * CH;
+  return c.light[idx(lx, gy, lz)];
+}
+
+function recomputeLight(c) {
+  const L = c.light, d = c.data;
+  L.fill(0);
+  const queue = [];
+  // 1) skylight columns: walk down until an opaque block
+  for (let x = 0; x < CH; x++) {
+    for (let z = 0; z < CH; z++) {
+      let v = 15;
+      for (let y = H - 1; y >= 0; y--) {
+        const b = d[idx(x, y, z)];
+        if (b === AIR || b === WATER || b === LAVA) { /* transparent */ }
+        else if (b === LEAVES) { if (v === 15) v = 11; }
+        else break;
+        L[idx(x, y, z)] = v;
+        queue.push(idx(x, y, z));
+      }
+    }
+  }
+  // 2) block light sources
+  for (let y = 0; y < H; y++) for (let z = 0; z < CH; z++) for (let x = 0; x < CH; x++) {
+    const b = d[idx(x, y, z)];
+    if (b === LAVA || b === GLOW) { const i = idx(x, y, z); if (L[i] < 15) { L[i] = 15; queue.push(i); } }
+  }
+  // 3) flood propagation (breadth first, -1 per step)
+  let head = 0;
+  while (head < queue.length) {
+    const i = queue[head++];
+    const lv = L[i];
+    if (lv <= 1) continue;
+    const x = i % CH;
+    const z = ((i / CH) | 0) % CH;
+    const y = ((i / (CH * CH)) | 0);
+    const nxt = lv - 1;
+    for (const [dx, dy, dz] of FACE_DIRS) {
+      const nx = x + dx, ny = y + dy, nz = z + dz;
+      if (ny < 0 || ny >= H) continue;
+      if (nx >= 0 && nx < CH && nz >= 0 && nz < CH && ny >= 0 && ny < H) {
+        const ti = idx(nx, ny, nz);
+        if (!TRANSPARENT_LIGHT(d[ti])) continue;
+        if (L[ti] >= nxt) continue;
+        L[ti] = nxt;
+        queue.push(ti);
+      }
+      // outside the chunk: neighbouring chunk recomputes itself (rare seams acceptable)
+    }
+  }
+}
+
+/* ============================ world gen ============================ */
 function worldGet(gx, gy, gz) {
   if (gy < 0) return BEDROCK;
   if (gy >= H) return AIR;
   const c = chunks.get(key(chunkOf(gx), chunkOf(gz)));
-  if (!c) return BEDROCK;
+  if (!c) return AIR;
   return c.data[idx(gx - c.cx * CH, gy, gz - c.cz * CH)];
 }
 function worldSet(gx, gy, gz, id) {
   if (gy < 1 || gy >= H) return;
-  const cx = chunkOf(gx), cz = chunkOf(gz);
-  const c = chunks.get(key(cx, cz));
+  const c = chunks.get(key(chunkOf(gx), chunkOf(gz)));
   if (!c) return;
-  c.data[idx(gx - cx * CH, gy, gz - cz * CH)] = id;
+  c.data[idx(gx - c.cx * CH, gy, gz - c.cz * CH)] = id;
 }
 
 function genChunk(c) {
   const d = c.data;
+  const cx0 = c.cx * CH, cz0 = c.cz * CH;
+  // columns: base layers + surface + lakes
   for (let x = 0; x < CH; x++) {
     for (let z = 0; z < CH; z++) {
-      const gx = c.cx * CH + x, gz = c.cz * CH + z;
+      const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
-      const top = h <= 25 ? SAND : GRASS;
+      const beach = h <= WL + 1;                       // sand near & under water
+      const top = beach ? SAND : GRASS;
       for (let y = 0; y < H; y++) {
         if (y === 0) d[idx(x, y, z)] = BEDROCK;
         else if (y < h - 3) d[idx(x, y, z)] = STONE;
-        else if (y < h) d[idx(x, y, z)] = top === SAND && y === h - 1 ? SAND : DIRT;
+        else if (y < h) d[idx(x, y, z)] = beach ? SAND : DIRT;
         else if (y === h) d[idx(x, y, z)] = top;
+        else if (y <= WL) d[idx(x, y, z)] = WATER;     // lakes
+        else break;
       }
     }
   }
-  for (let x = 0; x < CH; x++) {
-    for (let z = 0; z < CH; z++) {
-      const gx = c.cx * CH + x, gz = c.cz * CH + z;
+  // caves + lava + glowstone (3D noise carve)
+  for (let x = 1; x < CH - 1; x++) {
+    for (let z = 1; z < CH - 1; z++) {
+      const gx = cx0 + x, gz = cz0 + z;
+      const h = terrainH(gx, gz);
+      for (let y = 4; y < h - 4; y++) {
+        if (y > WL + 8) break;
+        const i = idx(x, y, z);
+        const n = noise3(gx * 0.085, y * 0.11, gz * 0.085);
+        if (n > 0.60) continue;
+        // widen: second frequency keeps tunnels from being too thin
+        const n2 = noise3(gx * 0.19 + 9, y * 0.23, gz * 0.19 - 4);
+        if (n < 0.34 && n2 < 0.5) {
+          d[i] = AIR;
+          // lava pools in deep cave floors
+          const below = d[idx(x, y - 1, z)];
+          if (y < 20 && SOLID.has(below) && Math.random() < 0.004) d[i] = LAVA;
+          else if (y < 16 && SOLID.has(below) && Math.random() < 0.0012) d[i] = GLOW;
+        }
+      }
+    }
+  }
+  // trees (clustered)
+  for (let x = 2; x < CH - 2; x++) {
+    for (let z = 2; z < CH - 2; z++) {
+      const gx = cx0 + x, gz = cz0 + z;
       const h = terrainH(gx, gz);
       if (worldGet(gx, h, gz) !== GRASS) continue;
       const r = hash2(gx * 3.1, gz * 1.7 + 9);
-      if (r > 0.006) continue;
-      const th = 4 + ((hash2(gx, gz * 2.3) * 3) | 0);
-      for (let t = 1; t <= th; t++) worldSet(gx, h + t, gz, LOG);
-      const topY = h + th;
-      for (let dy = -2; dy <= 0; dy++) {
-        const rad = dy === -2 ? 1 : 2;
-        for (let dx = -rad; dx <= rad; dx++) for (let dz = -rad; dz <= rad; dz++) {
-          if (dy === 0 && dx === 0 && dz === 0) continue;
-          if (dx * dx + dz * dz > rad * rad + 1) continue;
-          if (dx * dx + dz * dz > rad * rad && (Math.abs(dx) === 2 || Math.abs(dz) === 2)) continue;
-          worldSet(gx + dx, topY + dy, gz + dz, LEAVES);
+      if (r > 0.0042) continue;
+      // cluster: one tall + small companions
+      const n = 1 + ((hash2(gx, gz * 2.3) * 3) | 0);
+      for (let k = 0; k < n; k++) {
+        const tx = gx + ((hash2(gx + k * 7, gz + k * 13) * 5) | 0) - 2;
+        const tz = gz + ((hash2(gx + k * 11, gz + k * 3) * 5) | 0) - 2;
+        const th = terrainH(tx, tz);
+        if (worldGet(tx, th, tz) !== GRASS) continue;
+        const th2 = 4 + ((hash2(tx, tz * 2.3) * 3) | 0);
+        for (let t = 1; t <= th2; t++) worldSet(tx, th + t, tz, LOG);
+        const topY = th + th2;
+        for (let dy = -2; dy <= 0; dy++) {
+          const rad = dy === -2 ? 1 : 2;
+          for (let dx = -rad; dx <= rad; dx++) for (let dz = -rad; dz <= rad; dz++) {
+            if (dy === 0 && dx === 0 && dz === 0) continue;
+            if (dx * dx + dz * dz > rad * rad + 1) continue;
+            if (dx * dx + dz * dz > rad * rad && (Math.abs(dx) === 2 || Math.abs(dz) === 2)) continue;
+            worldSet(tx + dx, topY + dy, tz + dz, LEAVES);
+          }
         }
+        worldSet(tx, topY + 1, tz, LEAVES);
       }
-      worldSet(gx, topY + 1, gz, LEAVES);
     }
   }
+  recomputeLight(c);
 }
 
-/* --- meshing --- */
+/* ============================ meshing ============================ */
+const eps = 0.5 / ATLAS;
+function tileUV(tile) {
+  const tcol = tile % 4, trow = (tile / 4) | 0;
+  const u0 = (tcol * TILE + eps) / ATLAS, u1 = ((tcol + 1) * TILE - eps) / ATLAS;
+  const v0 = (trow * TILE + eps) / ATLAS, v1 = ((trow + 1) * TILE - eps) / ATLAS;
+  return [[u0, v0], [u0, v1], [u1, v1], [u1, v0]];
+}
+const FACE_UV = [
+  [[0, 0], [1, 0], [1, 1], [0, 1]],
+  [[0, 0], [1, 0], [1, 1], [0, 1]],
+  [[0, 0], [0, 1], [1, 1], [1, 0]],
+  [[1, 0], [1, 1], [0, 1], [0, 0]],
+  [[0, 0], [1, 0], [1, 1], [0, 1]],
+  [[1, 0], [0, 0], [0, 1], [1, 1]],
+];
 function meshChunk(c) {
-  const d = c.data;
+  const d = c.data, L = c.light;
   const pos = [], uv = [], col = [], ind = [];
-  const eps = 0.5 / ATLAS;
+  const lpos = [], luv = [], lcol = [], lind = [];
+  const cx0 = c.cx * CH, cz0 = c.cz * CH;
+
   for (let y = 0; y < H; y++) {
     for (let z = 0; z < CH; z++) {
       for (let x = 0; x < CH; x++) {
         const b = d[idx(x, y, z)];
         if (b === AIR) continue;
-        const gx = c.cx * CH + x, gz = c.cz * CH + z;
+        const liq = LIQUID.has(b);
+        const gx = cx0 + x, gz = cz0 + z;
         const blk = BLOCKS[b];
         for (let f = 0; f < 6; f++) {
           const dir = FACE_DIRS[f];
-          if (solidAt(gx + dir[0], y + dir[1], gz + dir[2])) continue;
-          const tile = f === 0 ? blk.top : f === 1 ? blk.bot : blk.side;
-          const tcol = tile % 4, trow = (tile / 4) | 0;
-          const u0 = (tcol * TILE + eps) / ATLAS, u1 = ((tcol + 1) * TILE - eps) / ATLAS;
-          const v0 = (trow * TILE + eps) / ATLAS, v1 = ((trow + 1) * TILE - eps) / ATLAS;
-          const uvQ =
-            f === 2 ? [[u0, v0], [u0, v1], [u1, v1], [u1, v0]]
-            : f === 3 ? [[u1, v0], [u1, v1], [u0, v1], [u0, v0]]
-            : f === 4 ? [[u0, v0], [u1, v0], [u1, v1], [u0, v1]]
-            : f === 5 ? [[u1, v0], [u0, v0], [u0, v1], [u1, v1]]
-            : [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
-          const lt = FACE_LIGHT[f];          // 0..1 (classic per-face brightness)
-          const base = pos.length / 3;
-          const q = QUAD_CORNERS[f];
-          for (let v = 0; v < 4; v++) {
-            pos.push(x + q[v][0], y + q[v][1], z + q[v][2]);   // LOCAL coords; mesh.position offsets the chunk
-            uv.push(uvQ[v][0], uvQ[v][1]);
-            col.push(lt, lt, lt);
+          const nx = x + dir[0], ny = y + dir[1], nz = z + dir[2];
+          let nb = 0;
+          if (nx >= 0 && nx < CH && nz >= 0 && nz < CH && ny >= 0 && ny < H) nb = d[idx(nx, ny, nz)];
+          else nb = worldGet(gx + dir[0], ny, gz + dir[2]);
+          if (liq) {
+            if (SOLID.has(nb)) continue;
+            if (nb === b) continue;               // same liquid hides face
+            if (LIQUID.has(nb)) continue;         // no water/lava contact faces
+          } else {
+            if (SOLID.has(nb)) continue;
           }
-          ind.push(base, base + 1, base + 2, base, base + 2, base + 3);
+          const tile = f === 0 ? blk.top : f === 1 ? blk.bot : blk.side;
+          const uvs = tileUV(tile);
+          // brightness from the light of the cell across the face
+          let bright;
+          if (liq) {
+            bright = b === LAVA ? 1.0 : Math.max(lightGet(gx + dir[0], y + dir[1], gz + dir[2]) / 15, 0.35);
+          } else {
+            bright = Math.max(lightGet(gx + dir[0], y + dir[1], gz + dir[2]) / 15, 0.05);
+          }
+          const lt = Math.min(1, bright * FACE_LIGHT[f]);
+          const P = liq ? lpos : pos, U = liq ? luv : uv, C = liq ? lcol : col, I = liq ? lind : ind;
+          const base = P.length / 3;
+          const q = QUAD_CORNERS[f];
+          const fu = FACE_UV[f];
+          for (let v = 0; v < 4; v++) {
+            P.push(q[v][0], q[v][1], q[v][2]);
+            U.push(uvs[fu[v][0]][0], uvs[fu[v][0]][1]);
+            C.push(lt, lt, lt);
+          }
+          I.push(base, base + 1, base + 2, base, base + 2, base + 3);
         }
       }
     }
   }
-  if (!ind.length) return null;
+  const out = { solid: null, liq: null };
+  if (ind.length) out.solid = makeMesh(pos, uv, col, ind, c, chunkMat);
+  if (lind.length) out.liq = makeMesh(lpos, luv, lcol, lind, c, waterMat);
+  return out;
+}
+function makeMesh(pos, uv, col, ind, c, mat) {
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
   g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
   g.setIndex(ind);
-  const m = new THREE.Mesh(g, chunkMat);
+  const m = new THREE.Mesh(g, mat);
   m.matrixAutoUpdate = false;
+  m.frustumCulled = false;               // static chunk meshes: skip culling
   m.position.set(c.cx * CH, 0, c.cz * CH);
   m.updateMatrix();
   return m;
@@ -221,8 +383,11 @@ function meshChunk(c) {
 
 function remesh(c) {
   if (c.mesh) { scene.remove(c.mesh); c.mesh.geometry.dispose(); c.mesh = null; }
-  c.mesh = meshChunk(c);
-  if (c.mesh) scene.add(c.mesh);
+  if (c.liqMesh) { scene.remove(c.liqMesh); c.liqMesh.geometry.dispose(); c.liqMesh = null; }
+  const m = meshChunk(c);
+  if (m.solid) scene.add(m.solid);
+  if (m.liq) scene.add(m.liq);
+  c.mesh = m.solid; c.liqMesh = m.liq;
   c.meshed = true;
 }
 
@@ -231,17 +396,16 @@ function updateChunks() {
   for (const c of [...chunks.values()]) {
     if (Math.abs(c.cx - pcx) > R + 1 || Math.abs(c.cz - pcz) > R + 1) {
       if (c.mesh) { scene.remove(c.mesh); c.mesh.geometry.dispose(); }
+      if (c.liqMesh) { scene.remove(c.liqMesh); c.liqMesh.geometry.dispose(); }
       chunks.delete(key(c.cx, c.cz));
     }
   }
-  // phase 1: make sure data exists for everything in radius (needed for correct edge culling)
   const need = [];
   for (let dx = -R; dx <= R; dx++) for (let dz = -R; dz <= R; dz++) {
     const cx = pcx + dx, cz = pcz + dz;
     const k = key(cx, cz);
     if (!chunks.has(k)) { const c = ensureChunk(cx, cz); genChunk(c); need.push(c); }
   }
-  // phase 2: mesh anything new (all neighbours now present)
   for (const c of need) remesh(c);
 }
 
@@ -251,6 +415,7 @@ function setBlock(gx, gy, gz, id) {
   const c = chunks.get(key(cx, cz));
   if (!c) return;
   c.data[idx(gx - cx * CH, gy, gz - cz * CH)] = id;
+  recomputeLight(c);
   remesh(c);
   const lx = gx - cx * CH, lz = gz - cz * CH;
   if (lx === 0) { const n = chunks.get(key(cx - 1, cz)); if (n && n.meshed) remesh(n); }
@@ -262,23 +427,44 @@ function setBlock(gx, gy, gz, id) {
 /* ============================ player ============================ */
 const player = {
   pos: new THREE.Vector3(8, 40, 8), vel: new THREE.Vector3(),
-  yaw: 0, pitch: -0.1, onGround: false, fly: false,
+  yaw: 0, pitch: -0.1, onGround: false, fly: false, swim: false,
 };
 const keys = new Set();
 const HALF = 0.3, EYE = 1.62;
 
 function spawn() {
-  player.pos.set(8.5, terrainH(8, 8) + 3, 8.5);
+  let sx = 8, sz = 8;
+  outer:
+  for (let r = 0; r < 30; r++) {
+    for (let a = 0; a < 12; a++) {
+      const gx = sx + Math.round(Math.cos(a / 12 * Math.PI * 2) * r);
+      const gz = sz + Math.round(Math.sin(a / 12 * Math.PI * 2) * r);
+      if (terrainH(gx, gz) >= WL + 2) { sx = gx; sz = gz; break outer; }
+    }
+  }
+  player.pos.set(sx + 0.5, terrainH(sx, sz) + 3, sz + 0.5);
   player.vel.set(0, 0, 0);
 }
 
 function cellSolid(x, y, z) {
   if (y < 0) return true;
   if (y >= H) return false;
-  const cx = chunkOf(x), cz = chunkOf(z);
-  const c = chunks.get(key(cx, cz));
+  const c = chunks.get(key(chunkOf(x), chunkOf(z)));
   if (!c) return false;
-  return c.data[idx(x - cx * CH, y, z - cz * CH)] !== AIR;
+  const b = c.data[idx(x - c.cx * CH, y, z - c.cz * CH)];
+  return SOLID.has(b);
+}
+function cellLiquid(x, y, z) {
+  if (y < 0 || y >= H) return false;
+  const c = chunks.get(key(chunkOf(x), chunkOf(z)));
+  if (!c) return false;
+  const b = c.data[idx(x - c.cx * CH, y, z - c.cz * CH)];
+  return LIQUID.has(b);
+}
+function inLiquid() {
+  const p = player.pos;
+  return cellLiquid(Math.floor(p.x), Math.floor(p.y + 0.4), Math.floor(p.z)) ||
+         cellLiquid(Math.floor(p.x), Math.floor(p.y + 1.4), Math.floor(p.z));
 }
 
 function collideAxis(axis, delta) {
@@ -308,22 +494,26 @@ function phys(dt) {
   const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
   let mx = -sin * fwd + cos * str, mz = -cos * fwd - sin * str;
   const ml = Math.hypot(mx, mz) || 1;
-  const spd = p.fly ? 10 : 4.6;
+  const wet = inLiquid();
+  p.swim = wet;
+  const spd = p.fly ? 10 : (wet ? 3.4 : 4.6);
   mx = (mx / ml) * spd; mz = (mz / ml) * spd;
 
   if (p.fly) {
     p.vel.x = mx; p.vel.z = mz;
     p.vel.y = (keys.has("Space") ? 1 : 0) * spd * 0.9 - ((keys.has("ShiftLeft") || keys.has("ControlLeft")) ? 1 : 0) * spd * 0.9;
-    collideAxis("x", p.vel.x * dt);
-    collideAxis("y", p.vel.y * dt);
-    collideAxis("z", p.vel.z * dt);
+  } else if (wet) {
     p.onGround = false;
-    return;
+    p.vel.x = mx; p.vel.z = mz;
+    p.vel.y -= 10 * dt;
+    if (keys.has("Space")) p.vel.y = Math.min(p.vel.y + 30 * dt, 4.6);
+    p.vel.y = Math.max(p.vel.y, -3.6);
+  } else {
+    p.onGround = false;
+    p.vel.x = mx; p.vel.z = mz;
+    p.vel.y -= 28 * dt;
+    if (keys.has("Space") && p.onGround) p.vel.y = 9.2;
   }
-  p.onGround = false;
-  p.vel.x = mx; p.vel.z = mz;
-  p.vel.y -= 28 * dt;
-  if (keys.has("Space") && p.onGround) p.vel.y = 9.2;
   collideAxis("x", p.vel.x * dt);
   collideAxis("y", p.vel.y * dt);
   collideAxis("z", p.vel.z * dt);
@@ -341,12 +531,16 @@ function pickBlock() {
   let tMZ = d.z > 0 ? (z + 1 - o.z) * tDZ : (o.z - z) * tDZ;
   let face = 0, t = 0;
   for (let i = 0; i < 200; i++) {
-    const solid = (y >= 0 && y < H) ? cellSolid(x, y, z) : y < 0;
-    if (solid && t <= REACH) return { x, y, z, face };
+    if (t > REACH) return null;
+    if (y >= 0 && y < H) {
+      const b = worldGet(x, y, z);
+      if (SOLID.has(b) && !LIQUID.has(b)) return { x, y, z, face };
+    } else if (y < 0) {
+      return { x, y, z, face };
+    }
     if (tMX < tMY && tMX < tMZ) { x += stepX; t = tMX; tMX += tDX; face = d.x > 0 ? 2 : 3; }
     else if (tMY < tMZ) { y += stepY; t = tMY; tMY += tDY; face = d.y > 0 ? 0 : 1; }
     else { z += stepZ; t = tMZ; tMZ += tDZ; face = d.z > 0 ? 4 : 5; }
-    if (t > REACH) return null;
   }
   return null;
 }
@@ -425,7 +619,6 @@ function requestLock() {
   } catch (e) { fallbackMode(); }
 }
 function fallbackMode() {
-  // sandboxed iframe may block pointer lock → drag to look (desktop only)
   if (IS_TOUCH) return;
   dragMode = true;
   ui.status.textContent = "drag to look";
@@ -448,7 +641,7 @@ ui.menu.querySelector("button").addEventListener("pointerdown", (e) => {
   if (!isLocked() && !dragMode) setTimeout(() => { if (!isLocked()) fallbackMode(); }, 300);
   ui.pause.classList.add("hidden");
   camera.rotation.set(player.pitch, player.yaw, 0);
-  toast("left click: mine · right click: place · F: fly · 1-7: blocks");
+  toast("left: mine · right: place · F: fly · 1-8: blocks · glow rock lights caves!");
 });
 ui.pause.addEventListener("pointerdown", (e) => { e.preventDefault(); requestLock(); });
 gl.addEventListener("click", () => { if (started && !IS_TOUCH) requestLock(); });
@@ -468,7 +661,6 @@ document.addEventListener("mousemove", (e) => {
   player.pitch = Math.max(-1.55, Math.min(1.55, player.pitch));
 });
 
-/* click handling (works locked or in drag mode) */
 gl.addEventListener("contextmenu", (e) => e.preventDefault());
 let downX = 0, downY = 0;
 gl.addEventListener("pointerdown", (e) => {
@@ -498,7 +690,7 @@ function doPlace() {
   const fd = FACE_DIRS[hit.face];
   const tx = hit.x + fd[0], ty = hit.y + fd[1], tz = hit.z + fd[2];
   if (ty < 1 || ty >= H) return;
-  if (cellSolid(tx, ty, tz)) return;
+  if (cellSolid(tx, ty, tz) || LIQUID.has(worldGet(tx, ty, tz))) return;
   if (boxOverlaps(tx, ty, tz)) return;
   setBlock(tx, ty, tz, HOTBAR[selected]);
   sndPlace();
@@ -527,7 +719,7 @@ addEventListener("wheel", (e) => {
 /* ============================ mobile controls ============================ */
 const IS_TOUCH = (("ontouchstart" in window) || navigator.maxTouchPoints > 0) && !window.matchMedia("(pointer: fine)").matches;
 const joy = { x: 0, y: 0, active: false, id: -1 };
-let touchLookOn = false, touchLookX = 0, touchLookY = 0, touchLookId = -1;
+let touchLookOn = false, touchLookX = 0, touchLookY = 0, touchLookId = -1, tapX = 0, tapY = 0;
 let mineMode = true;
 const ui2 = {
   wrap: document.getElementById("touchUI"),
@@ -539,7 +731,6 @@ const ui2 = {
   fly: document.getElementById("btnFly"),
   jump: document.getElementById("btnJump"),
 };
-
 function setVKey(code, on) { on ? keys.add(code) : keys.delete(code); }
 function clampJoy() {
   const dx = joy.x, dy = joy.y;
@@ -547,14 +738,12 @@ function clampJoy() {
   const r = 0.75;
   const nx = m > r ? dx / m * r : dx, ny = m > r ? dy / m * r : dy;
   joy.x = nx; joy.y = ny;
-  // map joystick to virtual WASD: up (neg y) = forward
   setVKey("KeyW", ny < -0.38);
   setVKey("KeyS", ny > 0.38);
   setVKey("KeyA", nx < -0.38);
   setVKey("KeyD", nx > 0.38);
   ui2.knob.style.transform = `translate(${nx * 40}px, ${ny * 40}px)`;
 }
-
 function bindMobile() {
   ui2.wrap.classList.remove("hidden");
   ui.status.textContent = "stick: move · drag right: look";
@@ -580,8 +769,6 @@ function bindMobile() {
   };
   ui2.joy.addEventListener("pointerup", joyEnd);
   ui2.joy.addEventListener("pointercancel", joyEnd);
-
-  // look: drag on the right half
   ui2.look.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     touchLookOn = true; touchLookId = e.pointerId;
@@ -598,19 +785,16 @@ function bindMobile() {
   const lookEnd = (e) => { if (e.pointerId === touchLookId) touchLookOn = false; };
   ui2.look.addEventListener("pointerup", lookEnd);
   ui2.look.addEventListener("pointercancel", lookEnd);
-
-  // tap centre = mine / place
   ui2.tap.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    touchLookId = -1; touchLookOn = false;   // never also look-drag
+    touchLookId = -1; touchLookOn = false;
     tapX = e.clientX; tapY = e.clientY;
   });
   ui2.tap.addEventListener("pointerup", (e) => {
     if (Math.hypot(e.clientX - tapX, e.clientY - tapY) > 12) return;
     if (mineMode) doBreak(); else doPlace();
   });
-
   ui2.mode.addEventListener("pointerdown", (e) => {
     e.preventDefault(); e.stopPropagation();
     mineMode = !mineMode;
@@ -632,7 +816,6 @@ function bindMobile() {
   ui2.jump.addEventListener("pointerup", () => setVKey("Space", false));
   ui2.jump.addEventListener("pointercancel", () => setVKey("Space", false));
 }
-let tapX = 0, tapY = 0;
 if (IS_TOUCH) bindMobile();
 
 /* ============================ loop ============================ */
@@ -661,9 +844,21 @@ window.__chud = {
   player,
   chunks: () => chunks.size,
   blockAt: (x, y, z) => worldGet(x, y, z),
+  set: (x, y, z, id) => setBlock(x, y, z, id),
+  lightAt: (x, y, z) => lightGet(x, y, z),
   seed: SEED,
   triangles: () => renderer.info.render.triangles,
   calls: () => renderer.info.render.calls,
-  mat: chunkMat,
-  atlasTex,
+  sceneKids: () => scene.children.map(m => m.geometry ? m.geometry.attributes.position.count : m.type),
+  firstGeo: () => { const m = scene.children.find(c => c.geometry && c.geometry.attributes.position); if (!m) return null; return { count: m.geometry.attributes.position.count, mat: m.material.type, fog: m.material.fog }; },
+  stats: () => {
+    const counts = {};
+    for (const c of chunks.values()) {
+      for (let i = 0; i < SZ; i++) {
+        const b = c.data[i];
+        counts[b] = (counts[b] || 0) + 1;
+      }
+    }
+    return counts;
+  },
 };
