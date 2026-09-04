@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>CHUDCRAFT — original voxel sandbox</title>
+<meta name="description" content="CHUDCRAFT: a free original voxel sandbox for the web. Mine, build, explore. All textures, code and art are original — fan-made, not affiliated with Mojang or Minecraft.">
+<link rel="icon" href="favicon.png" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#9fd9ff">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="CHUDCRAFT">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+  @font-face {
+    font-family: "ChudPixel";
+    src: url("fonts/chud.woff2") format("woff2");
+    font-weight: 400; font-style: normal;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  body { font-family: "ChudPixel", monospace; image-rendering: pixelated; }
+  #game { position: fixed; inset: 0; }
+  #gl { width: 100%; height: 100%; display: block; }
+
+  /* ---- overlays ---- */
+  .overlay {
+    position: fixed; inset: 0; z-index: 10;
+    display: grid; place-items: center;
+    background: radial-gradient(ellipse at 50% 30%, #1c2a3acc 0%, #0a0f16ee 70%);
+  }
+  .overlay.hidden { display: none; }
+  .panel { text-align: center; padding: 14px; user-select: none; }
+  h1 {
+    font-size: clamp(30px, 9vw, 72px); margin: 0 0 4px;
+    color: #d8f4ff; letter-spacing: 2px; line-height: 1.15;
+    text-shadow: 0 4px 0 #0a3a4a, 0 6px 0 #05202a, 0 8px 18px #000;
+  }
+  h1 .sub { display: block; font-size: clamp(11px, 2.6vw, 20px); color: #ffd97a;
+    text-shadow: 0 2px 0 #5a3a00, 0 3px 0 #0008; margin-top: 6px; letter-spacing: 1px; }
+  .seedline { color: #8fb8c8; font-size: clamp(8px, 2vw, 12px); margin: 8px 0 18px; letter-spacing: 1px; }
+  button.play {
+    font-family: inherit; font-size: clamp(16px, 4.5vw, 26px); letter-spacing: 2px;
+    color: #ffffff; text-shadow: 2px 2px 0 #3f3f3f;
+    padding: 13px 34px 11px; cursor: pointer;
+    background: linear-gradient(#d4d4d4, #bdbdbd 55%, #b4b4b4);
+    border: 2px solid #1a1a1a; border-radius: 0;
+    box-shadow: inset 2px 2px 0 #f2f2f2, inset -2px -2px 0 #757575, 0 3px 0 #0009;
+    transition: filter 0.06s;
+  }
+  button.play:hover { filter: brightness(1.04); }
+  button.play:active {
+    background: linear-gradient(#c0c0c0, #ababab);
+    box-shadow: inset 2px 2px 0 #757575, inset -2px -2px 0 #f2f2f2, 0 1px 0 #0009;
+    transform: translateY(1px);
+  }
+  .hints {
+    margin-top: 22px; color: #a9c8d6; font-size: clamp(7px, 1.8vw, 11px);
+    line-height: 2.1; letter-spacing: 0.5px;
+  }
+  .hints b { color: #ffd97a; font-weight: 400; }
+  .credit { margin-top: 14px; color: #5f7e8c; font-size: clamp(6px, 1.5vw, 9px); line-height: 1.8; }
+
+  /* pause */
+  #pause h2 { color: #ffd97a; font-size: clamp(18px, 5vw, 34px); text-shadow: 0 3px 0 #5a3a00, 0 5px 12px #000; letter-spacing: 3px; margin: 0 0 16px; }
+
+  /* crosshair */
+  #cross {
+    position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; z-index: 5;
+    transform: translate(-50%, -50%); pointer-events: none;
+  }
+  #cross::before, #cross::after {
+    content: ""; position: absolute; background: #000c;
+    box-shadow: 0 0 0 1px #fff6;
+  }
+  #cross::before { left: 50%; top: 0; width: 2px; height: 100%; margin-left: -1px; }
+  #cross::after { top: 50%; left: 0; height: 2px; width: 100%; margin-top: -1px; }
+
+  /* hotbar */
+  #hotbar {
+    position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    display: flex; gap: 6px; z-index: 6; padding: 6px; border-radius: 4px;
+    background: #0a0f16b0; border: 3px solid #222c; 
+    box-shadow: inset 0 0 0 2px #0000, inset 2px 2px 0 #ffffff26, 0 4px 0 #0006, 0 8px 16px #0008;
+  }
+  .slot {
+    width: 52px; height: 52px; padding: 0; border: 2px solid #1a1a1a; cursor: pointer;
+    background: #8b8b8b;
+    box-shadow: inset 2px 2px 0 #ffffff59, inset -2px -2px 0 #00000059;
+  }
+  .slot canvas { width: 100%; height: 100%; image-rendering: pixelated; display: block; }
+  .slot.on {
+    border-color: #ffffff;
+    box-shadow: inset 2px 2px 0 #ffffff59, inset -2px -2px 0 #00000059, 0 0 0 2px #ffffff;
+    transform: translateY(-2px);
+  }
+
+  /* toast */
+  #msg {
+    position: fixed; left: 50%; top: 16px; transform: translateX(-50%);
+    z-index: 7; color: #101820; background: #ffd97a; border: 3px solid #5a3a00;
+    padding: 8px 14px 6px; font-size: 11px; letter-spacing: 1px;
+    box-shadow: 0 4px 0 #5a3a00, 0 6px 14px #000a; pointer-events: none; text-align: center;
+    white-space: nowrap;
+  }
+  #status {
+    position: fixed; left: 10px; bottom: 8px; z-index: 6;
+    color: #cfe8ff; font-size: 9px; letter-spacing: 1px; text-shadow: 0 2px 3px #000;
+    pointer-events: none;
+  }
+  #seed {
+    position: fixed; right: 10px; bottom: 8px; z-index: 6;
+    color: #cfe8ff99; font-size: 9px; letter-spacing: 1px; text-shadow: 0 2px 3px #000;
+    pointer-events: none;
+  }
+
+  /* ---- mobile controls ---- */
+  #touchUI { position: fixed; inset: 0; z-index: 8; pointer-events: none; }
+  #lookZone {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 52%;
+    pointer-events: auto; touch-action: none; cursor: crosshair;
+  }
+  #joyZone {
+    position: absolute; left: 0; bottom: 0; width: 46%; height: 55%;
+    pointer-events: auto; touch-action: none;
+  }
+  #joyBase {
+    position: absolute; left: 24px; bottom: 26px; width: 116px; height: 116px;
+    border-radius: 50%; background: #00000052; border: 3px solid #ffffff59;
+    display: grid; place-items: center;
+  }
+  #joyKnob {
+    width: 52px; height: 52px; border-radius: 50%;
+    background: #ffffff94; border: 2px solid #fff;
+    box-shadow: 0 3px 6px #0006;
+  }
+  #tapZone {
+    position: absolute; left: 50%; top: 50%; width: 76px; height: 76px;
+    transform: translate(-50%, -50%); border-radius: 50%;
+    pointer-events: auto; touch-action: none;
+    border: 2px dashed #00000033; background: #ffffff12;
+  }
+  #tbtns {
+    position: absolute; right: 12px; bottom: calc(26px + env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; gap: 12px; pointer-events: auto;
+  }
+  .tbtn {
+    width: 60px; height: 60px; font-family: inherit; font-size: 24px; cursor: pointer;
+    color: #fff; text-shadow: 2px 2px 0 #3f3f3f;
+    background: linear-gradient(#d4d4d4, #bdbdbd 55%, #b4b4b4);
+    border: 2px solid #1a1a1a; border-radius: 0;
+    box-shadow: inset 2px 2px 0 #f2f2f2, inset -2px -2px 0 #757575, 0 3px 0 #0009;
+    padding: 0; display: grid; place-items: center;
+    -webkit-user-select: none; user-select: none;
+  }
+  .tbtn:active { transform: translateY(2px); }
+  .tbtn.on {
+    background: linear-gradient(#8f8f8f, #7a7a7a 55%, #6f6f6f);
+    box-shadow: inset 2px 2px 0 #555, inset -2px -2px 0 #aaa, 0 3px 0 #0009;
+  }
+  @media (max-width: 500px) {
+    .slot { width: 44px; height: 44px; }
+    #hotbar { gap: 4px; padding: 4px; bottom: 6px; }
+    #joyBase { width: 96px; height: 96px; left: 12px; bottom: 14px; }
+    #joyKnob { width: 44px; height: 44px; }
+    .tbtn { width: 52px; height: 52px; font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+<div id="game"></div>
+
+<div id="cross"></div>
+<div id="hotbar"></div>
+<div id="msg"></div>
+<div id="status"></div>
+<div id="seed"></div>
+
+<!-- mobile controls (shown on touch devices after PLAY) -->
+<div id="touchUI" class="hidden">
+  <div id="lookZone"></div>
+  <div id="joyZone"><div id="joyBase"><div id="joyKnob"></div></div></div>
+  <div id="tapZone" aria-label="mine / place"></div>
+  <div id="tbtns">
+    <button id="btnMode" class="tbtn" aria-label="switch mine/place">⛏</button>
+    <button id="btnFly" class="tbtn" aria-label="toggle flying">✈</button>
+    <button id="btnJump" class="tbtn" aria-label="jump">▲</button>
+  </div>
+</div>
+
+<div id="menu" class="overlay">
+  <div class="panel">
+    <h1>CHUDCRAFT
+      <span class="sub">a blocky sandbox · mine · build · chill</span>
+    </h1>
+    <div class="seedline" id="menuSeed">generating world…</div>
+    <button class="play">▶ PLAY</button>
+    <div class="hints">
+      <b>WASD</b> move &nbsp;·&nbsp; <b>SPACE</b> jump / fly up &nbsp;·&nbsp; <b>F</b> fly &nbsp;·&nbsp; <b>SHIFT</b> fly down<br>
+      <b>LMB</b> mine &nbsp;·&nbsp; <b>RMB</b> place &nbsp;·&nbsp; <b>1-7 / wheel</b> pick block &nbsp;·&nbsp; <b>ESC</b> pause
+    </div>
+    <div class="credit">
+      fan-made &amp; free · original textures, code &amp; shading · nothing taken from any game<br>
+      not affiliated with Mojang or Minecraft · font: Press Start 2P (OFL)
+    </div>
+  </div>
+</div>
+
+<div id="pause" class="overlay hidden">
+  <div class="panel">
+    <h2>⏸ PAUSED</h2>
+    <div class="hints">
+      click to resume<br>
+      <b>WASD</b> move · <b>SPACE</b> jump · <b>F</b> fly toggle<br>
+      <b>left click</b> mine · <b>right click</b> place<br>
+      <b>1–7</b> or <b>wheel</b>: select block
+    </div>
+  </div>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
